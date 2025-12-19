@@ -1,0 +1,318 @@
+// ==UserScript==
+// @name         NSFC_conclusion_downloader_V12_Final
+// @namespace    https://blog.rhilip.info/
+// @version      12.0_Final
+// @description  图片内容去重 + 可随时停止
+// @author       编码助手
+// @match        https://kd.nsfc.gov.cn/finalDetails*
+// @match        https://kd.nsfc.cn/finalDetails*
+// @require      https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js
+// @require      https://unpkg.com/jquery@3.6.0/dist/jquery.js
+// @grant        GM_log
+// ==/UserScript==
+
+/* globals $, jspdf */
+
+(async function() {
+    'use strict';
+
+    // 注入样式
+    $('head').append(`
+        <style>
+            #nsfc-panel {
+                width: 100%; margin-top: 10px; padding: 15px; border: 2px solid #409eff;
+                border-radius: 8px; background: #fff; box-shadow: 0 2px 12px 0 rgba(0,0,0,.1);
+            }
+            .nsfc-row { display: flex; align-items: center; margin-bottom: 10px; gap: 10px; flex-wrap: wrap; }
+            .nsfc-input {
+                width: 100px; padding: 5px; border: 1px solid #dcdfe6; border-radius: 4px; text-align: center;
+            }
+            #nsfc-prog-bg { width: 100%; height: 10px; background: #ebeef5; border-radius: 5px; overflow: hidden; }
+            #nsfc-prog-inner { width: 0%; height: 100%; background: #409eff; transition: width 0.3s; }
+            #nsfc-log { font-size: 12px; color: #666; margin-top: 8px; line-height: 1.8; }
+            .nsfc-btn { padding: 10px 24px; border: none; border-radius: 20px; cursor: pointer; font-size: 14px; font-weight: bold; }
+            .nsfc-btn-primary { background: #409eff; color: white; }
+            .nsfc-btn-danger { background: #f56c6c; color: white; }
+            .nsfc-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        </style>
+    `);
+
+    // 构建 UI
+    const panel = $(`
+        <div id="nsfc-panel">
+            <div class="nsfc-row">
+                <span style="font-weight:bold; color:#303133; font-size:16px;">📄 结题报告智能下载</span>
+            </div>
+            <div class="nsfc-row">
+                <label style="font-weight:500;">请求间隔:</label>
+                <input type="number" id="nsfc-delay" class="nsfc-input" value="1200" min="800" max="3000" step="100">
+                <span style="font-size:12px; color:#909399;">毫秒</span>
+            </div>
+            <div class="nsfc-row">
+                <button id="nsfc-start-btn" class="nsfc-btn nsfc-btn-primary">🚀 开始下载</button>
+                <button id="nsfc-stop-btn" class="nsfc-btn nsfc-btn-danger" style="display:none;">⏹️ 停止并生成PDF</button>
+                <span id="nsfc-status" style="font-size:13px; color:#67c23a; font-weight:500;"></span>
+            </div>
+            <div id="nsfc-prog-bg"><div id="nsfc-prog-inner"></div></div>
+            <div id="nsfc-log" style="padding:8px; background:#f5f7fa; border-radius:4px; margin-top:10px;">
+                💡 <b>智能去重：</b>检测到任何重复内容时自动停止<br>
+                🛑 <b>随时停止：</b>点击"停止"按钮可中断并立即生成PDF
+            </div>
+        </div>
+    `);
+
+    let isRunning = false;
+    let shouldStop = false;
+
+    // 计算图片hash值（用于内容去重）- 使用文件大小作为快速指纹
+    async function getImageHash(imageUrl) {
+        try {
+            const res = await fetch(imageUrl);
+            const blob = await res.blob();
+            const size = blob.size;
+
+            console.log(`图片大小: ${size} bytes, URL: ${imageUrl.substring(0, 80)}...`);
+
+            return size.toString(); // 直接用文件大小作为hash
+        } catch (e) {
+            console.error('计算hash失败:', e);
+            return null;
+        }
+    }
+
+    // 带重试的请求函数
+    async function fetchPageWithRetry(dependUintID, pageIndex, delay, maxRetries = 3) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            if (shouldStop) return { success: false, reason: 'stopped' };
+
+            try {
+                const response = await $.post('/api/baseQuery/completeProjectReport', {
+                    id: dependUintID,
+                    index: pageIndex
+                });
+
+                if (response?.code === 200 && response?.data?.url && response.data.url.trim() !== '') {
+                    return { success: true, url: response.data.url };
+                } else {
+                    return { success: false, reason: 'no_data' };
+                }
+            } catch (e) {
+                if (e.status === 503 && attempt < maxRetries) {
+                    const waitTime = delay * 2 * attempt;
+                    console.log(`第 ${pageIndex} 页遇到503，等待 ${waitTime}ms 后重试...`);
+                    await new Promise(r => setTimeout(r, waitTime));
+                } else if (attempt < maxRetries) {
+                    await new Promise(r => setTimeout(r, delay));
+                } else {
+                    return { success: false, reason: 'failed', error: e };
+                }
+            }
+        }
+        return { success: false, reason: 'max_retries' };
+    }
+
+    // 生成PDF的函数
+    async function generatePDF(pages, projectID, projectName) {
+        $('#nsfc-log').html(`📦 正在生成 PDF 文件，共 ${pages.length} 页...`);
+
+        const doc = new jspdf.jsPDF();
+        doc.deletePage(1);
+
+        for (let i = 0; i < pages.length; i++) {
+            const page = pages[i];
+            const progress = 50 + Math.floor(((i + 1) / pages.length) * 50);
+            $('#nsfc-prog-inner').css('width', `${progress}%`);
+            $('#nsfc-status').text(`生成PDF: ${i + 1}/${pages.length}`);
+            $('#nsfc-log').html(
+                `📥 正在处理第 ${page.index} 页图片...<br>` +
+                `进度: ${i + 1}/${pages.length} (${Math.round((i + 1) / pages.length * 100)}%)`
+            );
+
+            try {
+                // 重新下载图片
+                const res = await fetch(page.url);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+                const blob = await res.blob();
+                const img = new Image();
+                const objUrl = URL.createObjectURL(blob);
+                img.src = objUrl;
+                await img.decode();
+
+                doc.addPage([img.width, img.height], img.width < img.height ? 'p' : 'l');
+                doc.addImage(img, "PNG", 0, 0, img.width, img.height);
+
+                URL.revokeObjectURL(objUrl);
+            } catch (e) {
+                console.error(`第 ${page.index} 页图片处理失败:`, e);
+            }
+
+            await new Promise(r => setTimeout(r, 100));
+        }
+
+        $('#nsfc-prog-inner').css('width', '100%');
+
+        try {
+            doc.save(`${projectID}_${projectName}.pdf`);
+            $('#nsfc-log').html(
+                `✅ <b>下载完成！</b><br>` +
+                `📄 已生成包含 <b>${pages.length}</b> 页的完整报告<br>` +
+                `<span style="color:#67c23a;">文件已保存到下载文件夹</span>`
+            );
+            $('#nsfc-status').html(`<span style="color:#67c23a;">✓ 下载成功 (${pages.length}页)</span>`);
+        } catch (e) {
+            $('#nsfc-log').html(`❌ PDF 生成失败: ${e.message}`);
+        }
+    }
+
+    // 开始按钮点击事件
+    panel.on('click', '#nsfc-start-btn', async function() {
+        if (isRunning) return;
+
+        const delay = parseInt($('#nsfc-delay').val());
+        if (!delay || delay < 800) {
+            alert("请求间隔不能小于800毫秒！");
+            return;
+        }
+
+        isRunning = true;
+        shouldStop = false;
+
+        const startBtn = $('#nsfc-start-btn');
+        const stopBtn = $('#nsfc-stop-btn');
+
+        startBtn.hide();
+        stopBtn.show();
+
+        const urlParams = new URLSearchParams(location.search);
+        const dependUintID = urlParams.get('id');
+        const projectID = $('.basic_info div:contains("项目批准号：") + div').text().trim() || 'Project';
+        const projectName = $('.basic_info div:contains("项目名称：") + div').text().trim() || 'Report';
+
+        let successPages = [];
+        let pageHashes = new Map(); // 存储所有页面的hash: Map<hash, pageIndex>
+        let currentPage = 1;
+        let consecutiveFailures = 0;
+        let foundDuplicate = false;
+        const maxConsecutiveFailures = 3;
+
+        $('#nsfc-log').html(`📡 开始检索报告页面...<br>⏱️ 请求间隔: ${delay}ms<br>🔍 智能去重：检测到任何重复内容即停止`);
+        $('#nsfc-prog-inner').css('width', '0%');
+
+        // 持续请求，直到遇到重复内容或手动停止
+        while (!shouldStop && !foundDuplicate && consecutiveFailures < maxConsecutiveFailures) {
+            $('#nsfc-status').text(`检索第 ${currentPage} 页...`);
+            $('#nsfc-log').html(
+                `🔍 正在检索第 ${currentPage} 页...<br>` +
+                `<span style="color:#67c23a;">✓ 已获取: ${successPages.length} 页</span><br>` +
+                `<span style="color:#909399;">连续失败: ${consecutiveFailures}</span>`
+            );
+
+            const result = await fetchPageWithRetry(dependUintID, currentPage, delay);
+
+            if (result.success) {
+                // 计算图片内容hash
+                const hash = await getImageHash(result.url);
+
+                console.log(`第 ${currentPage} 页 hash: ${hash}`);
+
+                // 检查这个hash是否已经存在
+                if (hash && pageHashes.has(hash)) {
+                    const duplicatePageIndex = pageHashes.get(hash);
+                    foundDuplicate = true;
+                    console.log(`!!! 第 ${currentPage} 页文件大小 ${hash} 与第 ${duplicatePageIndex} 页相同，检测到循环！`);
+                    $('#nsfc-log').html(
+                        `✅ <b>第 ${currentPage} 页与第 ${duplicatePageIndex} 页内容相同 (${hash} bytes)</b><br>` +
+                        `<span style="color:#67c23a;">检测到循环，报告已完整！共 ${successPages.length} 页</span>`
+                    );
+                    // 立即跳出循环
+                    break;
+                } else {
+                    // 新的唯一内容，记录并继续
+                    if (hash) {
+                        pageHashes.set(hash, currentPage);
+                    }
+                    successPages.push({ index: currentPage, url: result.url });
+                    consecutiveFailures = 0;
+                    console.log(`✓ 第 ${currentPage} 页成功，文件大小: ${hash} bytes (唯一内容)`);
+                    $('#nsfc-log').html(
+                        `✓ 第 ${currentPage} 页成功 (大小: ${hash} bytes)<br>` +
+                        `<span style="color:#67c23a;">已获取: ${successPages.length} 页唯一内容</span>`
+                    );
+                }
+            } else {
+                if (result.reason !== 'stopped') {
+                    consecutiveFailures++;
+                    console.log(`✗ 第 ${currentPage} 页失败 (${result.reason})`);
+                }
+            }
+
+            currentPage++;
+
+            const estimatedProgress = Math.min((successPages.length / 20) * 50, 50);
+            $('#nsfc-prog-inner').css('width', `${estimatedProgress}%`);
+
+            if (!shouldStop && !foundDuplicate) {
+                await new Promise(r => setTimeout(r, delay));
+            }
+        }
+
+        // 检测停止原因
+        let stopReason = '';
+        if (shouldStop) {
+            stopReason = '用户手动停止';
+        } else if (foundDuplicate) {
+            stopReason = '检测到与第1页重复（报告完整）';
+        } else if (consecutiveFailures >= maxConsecutiveFailures) {
+            stopReason = '连续请求失败';
+        }
+
+        if (successPages.length === 0) {
+            $('#nsfc-log').html(
+                `❌ <b>未能获取任何页面！</b><br>` +
+                `停止原因: ${stopReason}<br>` +
+                `请尝试增加请求间隔或检查网络连接`
+            );
+            startBtn.show();
+            stopBtn.hide();
+            isRunning = false;
+            return;
+        }
+
+        // 生成PDF
+        $('#nsfc-log').html(
+            `✅ <b>检索完成！</b><br>` +
+            `停止原因: ${stopReason}<br>` +
+            `共获取 ${successPages.length} 页不重复内容<br>` +
+            `📥 开始生成PDF...`
+        );
+
+        await generatePDF(successPages, projectID, projectName);
+
+        startBtn.show().text('🔄 再次下载');
+        stopBtn.hide();
+        isRunning = false;
+    });
+
+    // 停止按钮点击事件
+    panel.on('click', '#nsfc-stop-btn', function() {
+        if (!isRunning) return;
+
+        shouldStop = true;
+        $('#nsfc-log').html(
+            `🛑 <b>正在停止...</b><br>` +
+            `将使用已获取的页面生成PDF`
+        );
+        $(this).prop('disabled', true).text('⏳ 停止中...');
+    });
+
+    // 插入面板
+    const observer = new MutationObserver(() => {
+        const target = $('div.link_title:has(div:contains("结题报告"))');
+        if (target.length > 0 && $('#nsfc-panel').length === 0) {
+            target.after(panel);
+        }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+
+})();
